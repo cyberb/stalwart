@@ -232,7 +232,7 @@ impl LdapDirectory {
                 for (attr, value) in SearchEntry::construct(entry).attrs {
                     if self.mappings.attr_email.contains(&attr.to_lowercase()) {
                         groups.extend(value.into_iter().filter_map(|v| {
-                            sanitize_email(&v).or_else(|| {
+                            sanitize_email(&complete_email(&v)).or_else(|| {
                                 trc::event!(
                                     Store(trc::StoreEvent::LdapWarning),
                                     Reason = "Group entry missing valid email attribute",
