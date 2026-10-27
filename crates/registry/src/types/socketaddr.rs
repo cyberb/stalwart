@@ -17,17 +17,21 @@ const UNSET_SOCKET_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
     std::net::IpAddr::V4(std::net::Ipv4Addr::from_octets([255, 255, 255, 255])),
     u16::MAX,
 );
+const UNIX_PREFIX: &str = "unix:";
+const UNIX_TAG: u8 = b'u';
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SocketAddr(pub std::net::SocketAddr);
+pub enum SocketAddr {
+    Inet(std::net::SocketAddr),
+    Unix { path: String, local_port: u16 },
+}
 
 impl SocketAddr {
-    pub fn into_inner(self) -> std::net::SocketAddr {
-        self.0
-    }
-
     pub fn is_valid(&self) -> bool {
-        self.0 != UNSET_SOCKET_ADDR
+        match self {
+            SocketAddr::Inet(addr) => *addr != UNSET_SOCKET_ADDR,
+            SocketAddr::Unix { path, .. } => path.starts_with('/'),
+        }
     }
 }
 
@@ -35,15 +39,39 @@ impl FromStr for SocketAddr {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse::<std::net::SocketAddr>()
-            .map(SocketAddr)
-            .map_err(|err| err.to_string())
+        let Some(path) = s.strip_prefix(UNIX_PREFIX) else {
+            return s
+                .parse::<std::net::SocketAddr>()
+                .map(SocketAddr::Inet)
+                .map_err(|err| err.to_string());
+        };
+        let (path, local_port) = match path.rsplit_once(':') {
+            Some((path, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                (path, port.parse::<u16>().map_err(|err| err.to_string())?)
+            }
+            _ => (path, 0),
+        };
+        if path.starts_with('/') {
+            Ok(SocketAddr::Unix {
+                path: path.to_string(),
+                local_port,
+            })
+        } else {
+            Err("Unix socket path must be absolute".to_string())
+        }
     }
 }
 
 impl Display for SocketAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            SocketAddr::Inet(addr) => write!(f, "{addr}"),
+            SocketAddr::Unix {
+                path,
+                local_port: 0,
+            } => write!(f, "{UNIX_PREFIX}{path}"),
+            SocketAddr::Unix { path, local_port } => write!(f, "{UNIX_PREFIX}{path}:{local_port}"),
+        }
     }
 }
 
@@ -68,26 +96,38 @@ impl<'de> serde::Deserialize<'de> for SocketAddr {
 
 impl Default for SocketAddr {
     fn default() -> Self {
-        SocketAddr(UNSET_SOCKET_ADDR)
-    }
-}
-
-impl AsRef<std::net::SocketAddr> for SocketAddr {
-    fn as_ref(&self) -> &std::net::SocketAddr {
-        &self.0
+        SocketAddr::Inet(UNSET_SOCKET_ADDR)
     }
 }
 
 impl Pickle for SocketAddr {
     fn pickle(&self, out: &mut Vec<u8>) {
-        self.0.ip().pickle(out);
-        self.0.port().pickle(out);
+        match self {
+            SocketAddr::Inet(addr) => {
+                addr.ip().pickle(out);
+                addr.port().pickle(out);
+            }
+            SocketAddr::Unix { path, local_port } => {
+                out.push(UNIX_TAG);
+                path.pickle(out);
+                local_port.pickle(out);
+            }
+        }
     }
 
     fn unpickle(data: &mut PickledStream<'_>) -> Option<Self> {
-        let ip = std::net::IpAddr::unpickle(data)?;
+        let ip = match data.read()? {
+            4 => std::net::IpAddr::V4(data.read_array::<4>()?.into()),
+            6 => std::net::IpAddr::V6(data.read_array::<16>()?.into()),
+            UNIX_TAG => {
+                let path = String::unpickle(data)?;
+                let local_port = u16::unpickle(data)?;
+                return Some(SocketAddr::Unix { path, local_port });
+            }
+            _ => return None,
+        };
         let port = u16::unpickle(data)?;
-        Some(SocketAddr(std::net::SocketAddr::new(ip, port)))
+        Some(SocketAddr::Inet(std::net::SocketAddr::new(ip, port)))
     }
 }
 
