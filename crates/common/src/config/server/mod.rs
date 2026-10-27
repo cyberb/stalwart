@@ -11,7 +11,7 @@ use registry::{
     types::{id::ObjectId, ipmask::IpAddrOrMask},
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Duration};
+use std::{fmt::Display, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use store::registry::RegistryObject;
 use tokio::net::TcpSocket;
 use utils::snowflake::SnowflakeIdGenerator;
@@ -33,6 +33,7 @@ pub struct Listener {
     pub id: String,
     pub protocol: ServerProtocol,
     pub listeners: Vec<TcpListener>,
+    pub unix_socket: Option<(PathBuf, SocketAddr)>,
     pub proxy_networks: Vec<IpAddrOrMask>,
     pub max_connections: u64,
     pub tls_timeout: Duration,

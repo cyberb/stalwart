@@ -9,13 +9,23 @@ use std::borrow::Cow;
 use proxy_header::io::ProxiedStream;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
+    net::{TcpStream, UnixStream},
 };
 use tokio_rustls::server::TlsStream;
 
 use super::SessionStream;
 
 impl SessionStream for TcpStream {
+    fn is_tls(&self) -> bool {
+        false
+    }
+
+    fn tls_version_and_cipher(&self) -> (Cow<'static, str>, Cow<'static, str>) {
+        (Cow::Borrowed(""), Cow::Borrowed(""))
+    }
+}
+
+impl SessionStream for UnixStream {
     fn is_tls(&self) -> bool {
         false
     }

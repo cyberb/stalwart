@@ -20,11 +20,17 @@ use socket2::{SockRef, TcpKeepalive};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 use store::registry::bootstrap::Bootstrap;
-use tokio::{net::TcpStream, sync::watch, time::timeout};
+use tokio::{
+    net::{TcpStream, UnixListener},
+    sync::watch,
+    time::timeout,
+};
 use tokio_rustls::server::TlsStream;
 use trc::{EventType, HttpEvent, ImapEvent, ManageSieveEvent, Pop3Event, SmtpEvent};
 use utils::UnwrapFailure;
@@ -41,6 +47,7 @@ impl Listener {
         let instance = Arc::new(ServerInstance {
             id: self.id,
             protocol: self.protocol,
+            unix_socket: self.unix_socket.is_some(),
             proxy_networks: self.proxy_networks,
             limiter: ConcurrencyLimiter::new(self.max_connections),
             tls_timeout: self.tls_timeout,
@@ -51,6 +58,11 @@ impl Listener {
         let is_tls = matches!(instance.acceptor, TcpAcceptor::Tls { implicit, .. } if implicit);
         let is_https = is_tls && self.protocol == ServerProtocol::Http;
         let has_proxies = !instance.proxy_networks.is_empty();
+
+        if let Some((path, local_addr)) = self.unix_socket {
+            spawn_unix(path, local_addr, instance, manager, inner);
+            return;
+        }
 
         // Spawn listeners
         for listener in self.listeners {
@@ -95,28 +107,7 @@ impl Listener {
             let instance = instance.clone();
             let inner = inner.clone();
             tokio::spawn(async move {
-                let (span_start, span_end) = match self.protocol {
-                    ServerProtocol::Smtp | ServerProtocol::Lmtp => (
-                        EventType::Smtp(SmtpEvent::ConnectionStart),
-                        EventType::Smtp(SmtpEvent::ConnectionEnd),
-                    ),
-                    ServerProtocol::Imap => (
-                        EventType::Imap(ImapEvent::ConnectionStart),
-                        EventType::Imap(ImapEvent::ConnectionEnd),
-                    ),
-                    ServerProtocol::Pop3 => (
-                        EventType::Pop3(Pop3Event::ConnectionStart),
-                        EventType::Pop3(Pop3Event::ConnectionEnd),
-                    ),
-                    ServerProtocol::Http => (
-                        EventType::Http(HttpEvent::ConnectionStart),
-                        EventType::Http(HttpEvent::ConnectionEnd),
-                    ),
-                    ServerProtocol::ManageSieve => (
-                        EventType::ManageSieve(ManageSieveEvent::ConnectionStart),
-                        EventType::ManageSieve(ManageSieveEvent::ConnectionEnd),
-                    ),
-                };
+                let (span_start, span_end) = span_events(self.protocol);
 
                 const ACCEPT_BACKOFF: Duration = Duration::from_millis(5);
                 const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
@@ -243,6 +234,104 @@ impl Listener {
             });
         }
     }
+}
+
+fn span_events(protocol: ServerProtocol) -> (EventType, EventType) {
+    match protocol {
+        ServerProtocol::Smtp | ServerProtocol::Lmtp => (
+            EventType::Smtp(SmtpEvent::ConnectionStart),
+            EventType::Smtp(SmtpEvent::ConnectionEnd),
+        ),
+        ServerProtocol::Imap => (
+            EventType::Imap(ImapEvent::ConnectionStart),
+            EventType::Imap(ImapEvent::ConnectionEnd),
+        ),
+        ServerProtocol::Pop3 => (
+            EventType::Pop3(Pop3Event::ConnectionStart),
+            EventType::Pop3(Pop3Event::ConnectionEnd),
+        ),
+        ServerProtocol::Http => (
+            EventType::Http(HttpEvent::ConnectionStart),
+            EventType::Http(HttpEvent::ConnectionEnd),
+        ),
+        ServerProtocol::ManageSieve => (
+            EventType::ManageSieve(ManageSieveEvent::ConnectionStart),
+            EventType::ManageSieve(ManageSieveEvent::ConnectionEnd),
+        ),
+    }
+}
+
+fn spawn_unix(
+    path: PathBuf,
+    local_addr: SocketAddr,
+    instance: Arc<ServerInstance>,
+    manager: impl SessionManager,
+    inner: Arc<Inner>,
+) {
+    let (span_start, span_end) = span_events(instance.protocol);
+
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(err) => {
+            trc::event!(
+                Network(trc::NetworkEvent::ListenError),
+                ListenerId = instance.id.clone(),
+                Details = path.to_string_lossy().to_compact_string(),
+                Reason = err.to_compact_string(),
+            );
+            return;
+        }
+    };
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+
+    trc::event!(
+        Network(trc::NetworkEvent::ListenStart),
+        ListenerId = instance.id.clone(),
+        Details = path.to_string_lossy().to_compact_string(),
+    );
+
+    let mut shutdown_rx = instance.shutdown_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                stream = listener.accept() => {
+                    match stream {
+                        Ok((stream, _)) => {
+                            let server = inner.build_server();
+                            if let Some(session) = instance.build_session(stream, local_addr, local_addr, &server) {
+                                manager.spawn(session, false, None, span_start, span_end);
+                            }
+                        }
+                        Err(err) => {
+                            trc::event!(
+                                Network(trc::NetworkEvent::AcceptError),
+                                ListenerId = instance.id.clone(),
+                                Reason = err.to_compact_string(),
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                                _ = shutdown_rx.changed() => {
+                                    manager.shutdown().await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                },
+                _ = shutdown_rx.changed() => {
+                    trc::event!(
+                        Network(trc::NetworkEvent::ListenStop),
+                        ListenerId = instance.id.clone(),
+                        Details = path.to_string_lossy().to_compact_string(),
+                    );
+                    manager.shutdown().await;
+                    let _ = std::fs::remove_file(&path);
+                    break;
+                }
+            }
+        }
+    });
 }
 
 trait BuildSession {
@@ -418,7 +507,8 @@ impl Listeners {
                     }
                 });
         }
-        self.servers.retain(|server| !server.listeners.is_empty());
+        self.servers
+            .retain(|server| !server.listeners.is_empty() || server.unix_socket.is_some());
     }
 
     pub fn spawn(

@@ -56,6 +56,7 @@ pub struct ServerInstance {
     pub id: String,
     pub protocol: ServerProtocol,
     pub acceptor: TcpAcceptor,
+    pub unix_socket: bool,
     pub limiter: ConcurrencyLimiter,
     pub proxy_networks: Vec<IpAddrOrMask>,
     pub tls_timeout: Duration,

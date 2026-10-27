@@ -26,6 +26,7 @@ use rustls::{
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr as StdSocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
 };
@@ -36,6 +37,17 @@ use types::id::Id;
 use utils::snowflake::SnowflakeIdGenerator;
 
 const DEFAULT_RECOVERY_MODE_PORT: u16 = 8080;
+
+pub fn unix_socket_path(listener: &str) -> Option<PathBuf> {
+    std::env::var("STALWART_UNIX_LISTENERS")
+        .ok()?
+        .split(',')
+        .find_map(|entry| {
+            let (name, path) = entry.split_once('=')?;
+            (name.trim() == listener && !path.trim().is_empty())
+                .then(|| PathBuf::from(path.trim()))
+        })
+}
 
 pub fn recovery_mode_port() -> u16 {
     std::env::var("STALWART_RECOVERY_MODE_PORT")
@@ -113,8 +125,17 @@ impl Listeners {
         };
 
         // Build listeners
+        let unix_socket = unix_socket_path(&listener.name).map(|path| {
+            let local_addr = listener
+                .bind
+                .iter()
+                .next()
+                .map(|addr| addr.0)
+                .unwrap_or_else(|| StdSocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+            (path, local_addr)
+        });
         let mut listeners = Vec::new();
-        for addr in listener.bind.iter() {
+        for addr in listener.bind.iter().filter(|_| unix_socket.is_none()) {
             // Parse bind address and build socket
             let mut addr = addr.0;
             let socket = match if addr.is_ipv4() {
@@ -221,6 +242,7 @@ impl Listeners {
             registry_id: id,
             protocol,
             listeners,
+            unix_socket,
             proxy_networks: if !listener.override_proxy_trusted_networks.is_empty() {
                 listener.override_proxy_trusted_networks.as_slice().to_vec()
             } else {
