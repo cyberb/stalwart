@@ -16,7 +16,7 @@ use registry::{
     },
     types::{datetime::UTCDateTime, id::ObjectId, list::List},
 };
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use store::registry::write::{RegistryWrite, RegistryWriteResult};
 use trc::AddContext;
 use types::id::Id;
@@ -24,6 +24,24 @@ use types::id::Id;
 pub struct AccountWithId {
     pub id: u32,
     pub account: Account,
+}
+
+static ADMIN_GROUP: LazyLock<Option<String>> = LazyLock::new(|| {
+    std::env::var("STALWART_DIRECTORY_ADMIN_GROUP")
+        .ok()
+        .map(|group| group.trim().to_lowercase())
+        .filter(|group| !group.is_empty())
+});
+
+fn directory_roles(groups: Option<&[String]>, current: &UserRoles) -> Option<UserRoles> {
+    let admin_group = ADMIN_GROUP.as_deref()?;
+    let is_admin = groups?.iter().any(|group| group == admin_group);
+    match (is_admin, current) {
+        (true, UserRoles::Admin) => None,
+        (true, _) => Some(UserRoles::Admin),
+        (false, UserRoles::Admin) => Some(UserRoles::User),
+        (false, _) => None,
+    }
 }
 
 impl Server {
@@ -120,6 +138,7 @@ impl Server {
                         });
                     }
                 }
+                let new_roles = directory_roles(account.groups.as_deref(), &current_user.roles);
                 let mut new_member_group_ids = None;
                 if let Some(groups) = account.groups {
                     let mut member_group_ids = Vec::with_capacity(groups.len());
@@ -147,7 +166,8 @@ impl Server {
                 let has_changes = secret.is_some()
                     || description.is_some()
                     || !new_aliases.is_empty()
-                    || new_member_group_ids.is_some();
+                    || new_member_group_ids.is_some()
+                    || new_roles.is_some();
 
                 if has_changes {
                     let mut updated_account = current_user.clone();
@@ -162,6 +182,9 @@ impl Server {
                     }
                     if let Some(member_group_ids) = new_member_group_ids {
                         updated_account.member_group_ids = member_group_ids.into();
+                    }
+                    if let Some(roles) = new_roles {
+                        updated_account.roles = roles;
                     }
                     let updated_account = Object::from(Account::User(updated_account));
                     match self
@@ -232,6 +255,8 @@ impl Server {
                         });
                     }
                 }
+                let roles = directory_roles(account.groups.as_deref(), &UserRoles::User)
+                    .unwrap_or(UserRoles::User);
                 let mut member_group_ids = Vec::new();
                 for email in account.groups.unwrap_or_default() {
                     member_group_ids.push(
@@ -257,7 +282,7 @@ impl Server {
                     #[cfg(feature = "enterprise")]
                     member_tenant_id: domain.id_tenant.map(Id::from),
                     // SPDX-SnippetEnd
-                    roles: UserRoles::User,
+                    roles,
                     credentials: List::from_iter(account.secret.map(|secret| {
                         Credential::Password(PasswordCredential {
                             credential_id: 0u64.into(),
