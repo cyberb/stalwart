@@ -15,9 +15,23 @@ use crate::{
 use compact_str::CompactString;
 use deadpool::managed::Object;
 use ldap3::{Ldap, ResultEntry, Scope, SearchEntry};
-use std::time::Duration;
+use std::{borrow::Cow, sync::LazyLock, time::Duration};
 use store::xxhash_rust;
 use utils::sanitize_email;
+
+static EMAIL_DOMAIN: LazyLock<Option<String>> = LazyLock::new(|| {
+    std::env::var("STALWART_DIRECTORY_EMAIL_DOMAIN")
+        .ok()
+        .map(|domain| domain.trim().to_string())
+        .filter(|domain| !domain.is_empty())
+});
+
+fn complete_email(value: &str) -> Cow<'_, str> {
+    match EMAIL_DOMAIN.as_deref() {
+        Some(domain) if !value.contains('@') => Cow::Owned(format!("{value}@{domain}")),
+        _ => Cow::Borrowed(value),
+    }
+}
 
 impl LdapDirectory {
     pub async fn authenticate(
@@ -315,7 +329,9 @@ impl LdapMappings {
             let is_email = self.attr_email.contains(&attr);
             let is_email_alias = self.attr_email_alias.contains(&attr);
             if is_email || is_email_alias {
-                let mut values = value.into_iter().filter_map(|v| sanitize_email(&v));
+                let mut values = value
+                    .into_iter()
+                    .filter_map(|v| sanitize_email(&complete_email(&v)));
                 if is_email
                     && account.email.is_empty()
                     && let Some(email) = values.next()
