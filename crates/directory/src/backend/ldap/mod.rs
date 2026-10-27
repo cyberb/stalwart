@@ -60,6 +60,7 @@ enum LdapFilterItem {
     Full,
     LocalPart,
     DomainPart,
+    RdnValue,
 }
 
 impl LdapFilter {
@@ -85,6 +86,11 @@ impl LdapFilter {
                     if let Some((_, domain)) = value.rsplit_once('@') {
                         result.push_str(ldap_escape(domain).as_ref());
                     }
+                }
+                LdapFilterItem::RdnValue => {
+                    let rdn = value.split(',').next().unwrap_or(value);
+                    let rdn = rdn.split_once('=').map(|(_, value)| value).unwrap_or(rdn);
+                    result.push_str(ldap_escape(rdn.trim()).as_ref());
                 }
             }
         }

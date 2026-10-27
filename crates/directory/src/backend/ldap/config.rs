@@ -187,6 +187,7 @@ impl LdapFilter {
                         "user" | "username" | "email" => filter.push(LdapFilterItem::Full),
                         "local" => filter.push(LdapFilterItem::LocalPart),
                         "domain" => filter.push(LdapFilterItem::DomainPart),
+                        "rdn" => filter.push(LdapFilterItem::RdnValue),
                         _ => {
                             return Err(format!("Unknown LDAP filter placeholder: {}", token));
                         }
