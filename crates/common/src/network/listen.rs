@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     BuildServer, Inner, Server,
-    config::server::{Listener, Listeners, ServerProtocol, TcpListener},
+    config::server::{Listener, ListenerSocket, Listeners, ServerProtocol, TcpListener},
 };
 use compact_str::{ToCompactString, format_compact};
 use proxy_header::io::ProxiedStream;
@@ -20,11 +20,17 @@ use socket2::{SockRef, TcpKeepalive};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 use store::registry::bootstrap::Bootstrap;
-use tokio::{net::TcpStream, sync::watch, time::timeout};
+use tokio::{
+    net::{TcpStream, UnixStream},
+    sync::watch,
+    time::timeout,
+};
 use tokio_rustls::server::TlsStream;
 use trc::{EventType, HttpEvent, ImapEvent, ManageSieveEvent, Pop3Event, SmtpEvent};
 use utils::UnwrapFailure;
@@ -48,201 +54,325 @@ impl Listener {
             shutdown_rx,
             span_id_gen: self.span_id_gen,
         });
-        let is_tls = matches!(instance.acceptor, TcpAcceptor::Tls { implicit, .. } if implicit);
-        let is_https = is_tls && self.protocol == ServerProtocol::Http;
-        let has_proxies = !instance.proxy_networks.is_empty();
 
         // Spawn listeners
         for listener in self.listeners {
-            let local_addr = listener.addr;
+            listener.spawn(instance.clone(), manager.clone(), inner.clone());
+        }
+    }
+}
 
-            // Obtain TCP options
-            let opts = SocketOpts {
-                nodelay: listener.nodelay,
-                ttl: listener.ttl,
-            };
+impl ListenerSocket {
+    fn bind(&self) -> io::Result<()> {
+        match self {
+            ListenerSocket::Tcp(listener) => listener.socket.bind(listener.addr),
+            ListenerSocket::Unix(_) => Ok(()),
+        }
+    }
 
-            // Bind socket
-            let listener = match listener.listen() {
-                Ok(listener) => {
+    fn local_addr(&self) -> SocketAddr {
+        match self {
+            ListenerSocket::Tcp(listener) => listener.addr,
+            ListenerSocket::Unix(listener) => listener.local_addr,
+        }
+    }
+
+    fn spawn(self, instance: Arc<ServerInstance>, manager: impl SessionManager, inner: Arc<Inner>) {
+        let is_tls = matches!(instance.acceptor, TcpAcceptor::Tls { implicit, .. } if implicit);
+
+        match self {
+            ListenerSocket::Tcp(listener) => {
+                let local_addr = listener.addr;
+
+                // Obtain TCP options
+                let opts = SocketOpts {
+                    nodelay: listener.nodelay,
+                    ttl: listener.ttl,
+                };
+
+                // Bind socket
+                match listener.listen() {
+                    Ok(listener) => {
+                        trc::event!(
+                            Network(trc::NetworkEvent::ListenStart),
+                            ListenerId = instance.id.clone(),
+                            LocalIp = local_addr.ip(),
+                            LocalPort = local_addr.port(),
+                            Tls = is_tls,
+                        );
+
+                        spawn_listener(
+                            TcpStreamListener { listener, opts },
+                            local_addr,
+                            instance.clone(),
+                            manager.clone(),
+                            inner.clone(),
+                        );
+                    }
+                    Err(err) => {
+                        trc::event!(
+                            Network(trc::NetworkEvent::ListenError),
+                            ListenerId = instance.id.clone(),
+                            LocalIp = local_addr.ip(),
+                            LocalPort = local_addr.port(),
+                            Tls = is_tls,
+                            Reason = err,
+                        );
+                    }
+                }
+            }
+            ListenerSocket::Unix(listener) => match bind_unix(&listener.path) {
+                Ok(unix) => {
                     trc::event!(
                         Network(trc::NetworkEvent::ListenStart),
                         ListenerId = instance.id.clone(),
-                        LocalIp = local_addr.ip(),
-                        LocalPort = local_addr.port(),
+                        Details = listener.path.to_string_lossy().to_compact_string(),
                         Tls = is_tls,
                     );
 
-                    listener
+                    spawn_listener(
+                        UnixStreamListener {
+                            listener: unix,
+                            path: listener.path,
+                            local_addr: listener.local_addr,
+                        },
+                        listener.local_addr,
+                        instance.clone(),
+                        manager.clone(),
+                        inner.clone(),
+                    );
                 }
                 Err(err) => {
                     trc::event!(
                         Network(trc::NetworkEvent::ListenError),
                         ListenerId = instance.id.clone(),
-                        LocalIp = local_addr.ip(),
-                        LocalPort = local_addr.port(),
+                        Details = listener.path.to_string_lossy().to_compact_string(),
                         Tls = is_tls,
-                        Reason = err,
+                        Reason = err.to_compact_string(),
                     );
-
-                    continue;
                 }
-            };
-
-            // Spawn listener
-            let mut shutdown_rx = instance.shutdown_rx.clone();
-            let manager = manager.clone();
-            let instance = instance.clone();
-            let inner = inner.clone();
-            tokio::spawn(async move {
-                let (span_start, span_end) = match self.protocol {
-                    ServerProtocol::Smtp | ServerProtocol::Lmtp => (
-                        EventType::Smtp(SmtpEvent::ConnectionStart),
-                        EventType::Smtp(SmtpEvent::ConnectionEnd),
-                    ),
-                    ServerProtocol::Imap => (
-                        EventType::Imap(ImapEvent::ConnectionStart),
-                        EventType::Imap(ImapEvent::ConnectionEnd),
-                    ),
-                    ServerProtocol::Pop3 => (
-                        EventType::Pop3(Pop3Event::ConnectionStart),
-                        EventType::Pop3(Pop3Event::ConnectionEnd),
-                    ),
-                    ServerProtocol::Http => (
-                        EventType::Http(HttpEvent::ConnectionStart),
-                        EventType::Http(HttpEvent::ConnectionEnd),
-                    ),
-                    ServerProtocol::ManageSieve => (
-                        EventType::ManageSieve(ManageSieveEvent::ConnectionStart),
-                        EventType::ManageSieve(ManageSieveEvent::ConnectionEnd),
-                    ),
-                };
-
-                const ACCEPT_BACKOFF: Duration = Duration::from_millis(5);
-                const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
-                let mut accept_backoff = ACCEPT_BACKOFF;
-
-                loop {
-                    tokio::select! {
-                        stream = listener.accept() => {
-                            match stream {
-                                Ok((stream, remote_addr)) => {
-                                    accept_backoff = ACCEPT_BACKOFF;
-
-                                    let server = inner.build_server();
-                                    let enable_acme = (is_https && server.has_acme_tls_providers()).then(|| server.clone());
-
-                                    if has_proxies && instance.proxy_networks.iter().any(|network| network.matches(&remote_addr.ip())) {
-                                        let instance = instance.clone();
-                                        let manager = manager.clone();
-
-                                        // Set socket options
-                                        opts.apply(&stream);
-
-                                        tokio::spawn(async move {
-                                            match timeout(instance.tls_timeout, ProxiedStream::create_from_tokio(stream, Default::default())).await {
-                                                Ok(Ok(stream)) =>{
-                                                    let (remote_addr, local_addr) = stream.proxy_header()
-                                                                            .proxied_address()
-                                                                            .map(|addr| {
-                                                                                let local_addr = match addr.destination.ip() {
-                                                                                    IpAddr::V6(ip) => ip
-                                                                                        .to_ipv4_mapped()
-                                                                                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), addr.destination.port()))
-                                                                                        .unwrap_or(addr.destination),
-                                                                                    _ => addr.destination,
-                                                                                };
-
-                                                                                (addr.source, local_addr)
-                                                                            })
-                                                                            .unwrap_or((remote_addr, local_addr));
-                                                    if let Some(session) = instance.build_session(stream, local_addr, remote_addr, &server) {
-                                                        // Spawn session
-                                                        manager.spawn(session, is_tls, enable_acme, span_start, span_end);
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    trc::event!(
-                                                        Network(trc::NetworkEvent::Timeout),
-                                                        ListenerId = instance.id.clone(),
-                                                        LocalIp = local_addr.ip(),
-                                                        LocalPort = local_addr.port(),
-                                                        RemoteIp = remote_addr.ip(),
-                                                        Tls = is_tls,
-                                                        Reason = "PROXY protocol header timeout",
-                                                    );
-                                                }
-                                                Ok(Err(err)) => {
-                                                    trc::event!(
-                                                        Network(trc::NetworkEvent::ProxyError),
-                                                        ListenerId = instance.id.clone(),
-                                                        LocalIp = local_addr.ip(),
-                                                        LocalPort = local_addr.port(),
-                                                        RemoteIp = remote_addr.ip(),
-                                                        RemotePort = remote_addr.port(),
-                                                        Tls = is_tls,
-                                                        Reason = err.to_compact_string(),
-                                                    );
-                                                }
-                                            }
-                                        });
-                                    } else if let Some(session) = instance.build_session(stream, local_addr, remote_addr, &server) {
-                                        // Set socket options
-                                        opts.apply(&session.stream);
-
-                                        // Spawn session
-                                        manager.spawn(session, is_tls, enable_acme, span_start, span_end);
-                                    }
-                                }
-                                Err(err) => {
-                                    if matches!(
-                                        err.kind(),
-                                        std::io::ErrorKind::ConnectionAborted
-                                            | std::io::ErrorKind::ConnectionReset
-                                            | std::io::ErrorKind::Interrupted
-                                    ) {
-                                        continue;
-                                    }
-
-                                    trc::event!(
-                                        Network(trc::NetworkEvent::AcceptError),
-                                        ListenerId = instance.id.clone(),
-                                        LocalIp = local_addr.ip(),
-                                        LocalPort = local_addr.port(),
-                                        Tls = is_tls,
-                                        Reason = err.to_compact_string(),
-                                    );
-
-                                    tokio::select! {
-                                        _ = tokio::time::sleep(accept_backoff) => {}
-                                        _ = shutdown_rx.changed() => {
-                                            manager.shutdown().await;
-                                            break;
-                                        }
-                                    }
-
-                                    accept_backoff = (accept_backoff * 2).min(MAX_ACCEPT_BACKOFF);
-                                }
-                            }
-                        },
-                        _ = shutdown_rx.changed() => {
-
-                            trc::event!(
-                                Network(trc::NetworkEvent::ListenStop),
-                                ListenerId = instance.id.clone(),
-                                LocalIp = local_addr.ip(),
-                                Tls = is_tls,
-                                LocalPort = local_addr.port(),
-                            );
-
-                            manager.shutdown().await;
-                            break;
-                        }
-                    };
-                }
-            });
+            },
         }
     }
+}
+
+trait StreamListener: Send + Sync + 'static {
+    type Stream: SessionStream;
+    const PROXY_PROTOCOL: bool;
+
+    fn accept(
+        &self,
+    ) -> impl std::future::Future<Output = io::Result<(Self::Stream, SocketAddr)>> + Send;
+
+    fn close(&self) {}
+}
+
+struct TcpStreamListener {
+    listener: tokio::net::TcpListener,
+    opts: SocketOpts,
+}
+
+impl StreamListener for TcpStreamListener {
+    type Stream = TcpStream;
+    const PROXY_PROTOCOL: bool = true;
+
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let (stream, remote_addr) = self.listener.accept().await?;
+        self.opts.apply(&stream);
+        Ok((stream, remote_addr))
+    }
+}
+
+struct UnixStreamListener {
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
+    local_addr: SocketAddr,
+}
+
+impl StreamListener for UnixStreamListener {
+    type Stream = UnixStream;
+    const PROXY_PROTOCOL: bool = false;
+
+    async fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
+        let (stream, _) = self.listener.accept().await?;
+        Ok((stream, self.local_addr))
+    }
+
+    fn close(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn bind_unix(path: &Path) -> io::Result<tokio::net::UnixListener> {
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "Socket is in use by another process",
+        ));
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    Ok(listener)
+}
+
+fn spawn_listener<L: StreamListener>(
+    listener: L,
+    local_addr: SocketAddr,
+    instance: Arc<ServerInstance>,
+    manager: impl SessionManager,
+    inner: Arc<Inner>,
+) {
+    let is_tls = matches!(instance.acceptor, TcpAcceptor::Tls { implicit, .. } if implicit);
+    let is_https = is_tls && instance.protocol == ServerProtocol::Http;
+    let has_proxies = !instance.proxy_networks.is_empty();
+
+    let mut shutdown_rx = instance.shutdown_rx.clone();
+    tokio::spawn(async move {
+        let (span_start, span_end) = match instance.protocol {
+            ServerProtocol::Smtp | ServerProtocol::Lmtp => (
+                EventType::Smtp(SmtpEvent::ConnectionStart),
+                EventType::Smtp(SmtpEvent::ConnectionEnd),
+            ),
+            ServerProtocol::Imap => (
+                EventType::Imap(ImapEvent::ConnectionStart),
+                EventType::Imap(ImapEvent::ConnectionEnd),
+            ),
+            ServerProtocol::Pop3 => (
+                EventType::Pop3(Pop3Event::ConnectionStart),
+                EventType::Pop3(Pop3Event::ConnectionEnd),
+            ),
+            ServerProtocol::Http => (
+                EventType::Http(HttpEvent::ConnectionStart),
+                EventType::Http(HttpEvent::ConnectionEnd),
+            ),
+            ServerProtocol::ManageSieve => (
+                EventType::ManageSieve(ManageSieveEvent::ConnectionStart),
+                EventType::ManageSieve(ManageSieveEvent::ConnectionEnd),
+            ),
+        };
+
+        const ACCEPT_BACKOFF: Duration = Duration::from_millis(5);
+        const MAX_ACCEPT_BACKOFF: Duration = Duration::from_secs(1);
+        let mut accept_backoff = ACCEPT_BACKOFF;
+
+        loop {
+            tokio::select! {
+                stream = listener.accept() => {
+                    match stream {
+                        Ok((stream, remote_addr)) => {
+                            accept_backoff = ACCEPT_BACKOFF;
+
+                            let server = inner.build_server();
+                            let enable_acme = (is_https && server.has_acme_tls_providers()).then(|| server.clone());
+
+                            if L::PROXY_PROTOCOL && has_proxies && instance.proxy_networks.iter().any(|network| network.matches(&remote_addr.ip())) {
+                                let instance = instance.clone();
+                                let manager = manager.clone();
+
+
+                                tokio::spawn(async move {
+                                    match timeout(instance.tls_timeout, ProxiedStream::create_from_tokio(stream, Default::default())).await {
+                                        Ok(Ok(stream)) =>{
+                                            let (remote_addr, local_addr) = stream.proxy_header()
+                                                                    .proxied_address()
+                                                                    .map(|addr| {
+                                                                        let local_addr = match addr.destination.ip() {
+                                                                            IpAddr::V6(ip) => ip
+                                                                                .to_ipv4_mapped()
+                                                                                .map(|ip| SocketAddr::new(IpAddr::V4(ip), addr.destination.port()))
+                                                                                .unwrap_or(addr.destination),
+                                                                            _ => addr.destination,
+                                                                        };
+
+                                                                        (addr.source, local_addr)
+                                                                    })
+                                                                    .unwrap_or((remote_addr, local_addr));
+                                            if let Some(session) = instance.build_session(stream, local_addr, remote_addr, &server) {
+                                                // Spawn session
+                                                manager.spawn(session, is_tls, enable_acme, span_start, span_end);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            trc::event!(
+                                                Network(trc::NetworkEvent::Timeout),
+                                                ListenerId = instance.id.clone(),
+                                                LocalIp = local_addr.ip(),
+                                                LocalPort = local_addr.port(),
+                                                RemoteIp = remote_addr.ip(),
+                                                Tls = is_tls,
+                                                Reason = "PROXY protocol header timeout",
+                                            );
+                                        }
+                                        Ok(Err(err)) => {
+                                            trc::event!(
+                                                Network(trc::NetworkEvent::ProxyError),
+                                                ListenerId = instance.id.clone(),
+                                                LocalIp = local_addr.ip(),
+                                                LocalPort = local_addr.port(),
+                                                RemoteIp = remote_addr.ip(),
+                                                RemotePort = remote_addr.port(),
+                                                Tls = is_tls,
+                                                Reason = err.to_compact_string(),
+                                            );
+                                        }
+                                    }
+                                });
+                            } else if let Some(session) = instance.build_session(stream, local_addr, remote_addr, &server) {
+
+                                // Spawn session
+                                manager.spawn(session, is_tls, enable_acme, span_start, span_end);
+                            }
+                        }
+                        Err(err) => {
+                            if matches!(
+                                err.kind(),
+                                std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::Interrupted
+                            ) {
+                                continue;
+                            }
+
+                            trc::event!(
+                                Network(trc::NetworkEvent::AcceptError),
+                                ListenerId = instance.id.clone(),
+                                LocalIp = local_addr.ip(),
+                                LocalPort = local_addr.port(),
+                                Tls = is_tls,
+                                Reason = err.to_compact_string(),
+                            );
+
+                            tokio::select! {
+                                _ = tokio::time::sleep(accept_backoff) => {}
+                                _ = shutdown_rx.changed() => {
+                                    manager.shutdown().await;
+                                    break;
+                                }
+                            }
+
+                            accept_backoff = (accept_backoff * 2).min(MAX_ACCEPT_BACKOFF);
+                        }
+                    }
+                },
+                _ = shutdown_rx.changed() => {
+
+                    trc::event!(
+                        Network(trc::NetworkEvent::ListenStop),
+                        ListenerId = instance.id.clone(),
+                        LocalIp = local_addr.ip(),
+                        Tls = is_tls,
+                        LocalPort = local_addr.port(),
+                    );
+
+                    manager.shutdown().await;
+                    break;
+                }
+            };
+        }
+
+        listener.close();
+    });
 }
 
 trait BuildSession {
@@ -401,22 +531,20 @@ impl Listeners {
         for server in &mut self.servers {
             let registry_id = server.registry_id;
             let server_id = &server.id;
-            server
-                .listeners
-                .retain(|listener| match listener.socket.bind(listener.addr) {
-                    Ok(()) => true,
-                    Err(err) => {
-                        trc::event!(
-                            Network(trc::NetworkEvent::ListenError),
-                            ListenerId = server_id.clone(),
-                            LocalIp = listener.addr.ip(),
-                            LocalPort = listener.addr.port(),
-                            Reason = err.to_compact_string(),
-                        );
-                        on_error(registry_id, listener.addr, err);
-                        false
-                    }
-                });
+            server.listeners.retain(|listener| match listener.bind() {
+                Ok(()) => true,
+                Err(err) => {
+                    trc::event!(
+                        Network(trc::NetworkEvent::ListenError),
+                        ListenerId = server_id.clone(),
+                        LocalIp = listener.local_addr().ip(),
+                        LocalPort = listener.local_addr().port(),
+                        Reason = err.to_compact_string(),
+                    );
+                    on_error(registry_id, listener.local_addr(), err);
+                    false
+                }
+            });
         }
         self.servers.retain(|server| !server.listeners.is_empty());
     }

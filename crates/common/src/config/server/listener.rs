@@ -5,7 +5,8 @@
  */
 
 use super::{
-    DEFAULT_TLS_TIMEOUT, Listener, Listeners, ServerProtocol, TcpListener,
+    DEFAULT_TLS_TIMEOUT, Listener, ListenerSocket, Listeners, ServerProtocol, TcpListener,
+    UnixListener,
     tls::{TLS12_VERSION, TLS13_VERSION},
 };
 use crate::{
@@ -26,6 +27,7 @@ use rustls::{
 };
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr as StdSocketAddr},
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
 };
@@ -116,7 +118,19 @@ impl Listeners {
         let mut listeners = Vec::new();
         for addr in listener.bind.iter() {
             // Parse bind address and build socket
-            let mut addr = addr.0;
+            let mut addr = match addr {
+                SocketAddr::Inet(addr) => *addr,
+                SocketAddr::Unix { path, local_port } => {
+                    listeners.push(ListenerSocket::Unix(UnixListener {
+                        path: PathBuf::from(path),
+                        local_addr: StdSocketAddr::new(
+                            IpAddr::V4(Ipv4Addr::LOCALHOST),
+                            *local_port,
+                        ),
+                    }));
+                    continue;
+                }
+            };
             let socket = match if addr.is_ipv4() {
                 TcpSocket::new_v4()
             } else {
@@ -201,13 +215,13 @@ impl Listeners {
                 return;
             }
 
-            listeners.push(TcpListener {
+            listeners.push(ListenerSocket::Tcp(TcpListener {
                 socket,
                 addr,
                 ttl: listener.socket_ttl.map(|v| v as u32),
                 backlog: listener.socket_backlog.map(|v| v as u32),
                 nodelay: listener.socket_no_delay,
-            });
+            }));
         }
 
         let span_id_gen = self.span_id_gen.clone();
