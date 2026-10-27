@@ -30,6 +30,7 @@ define_tokens_64! {
     ETRN,
     ATRN,
     BURL,
+    XCLIENT,
     STARTTLS,
 
     // Arguments

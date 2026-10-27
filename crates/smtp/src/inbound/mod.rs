@@ -19,6 +19,7 @@ pub mod session;
 pub mod spam;
 pub mod spawn;
 pub mod vrfy;
+pub mod xclient;
 
 #[derive(Debug, Default)]
 pub struct FilterResponse {

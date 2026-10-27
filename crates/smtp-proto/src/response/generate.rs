@@ -112,6 +112,7 @@ impl<T: Display> EhloResponse<T> {
                 EXT_SMTP_UTF8 => writer.write_all(b"SMTPUTF8\r\n"),
                 EXT_START_TLS => writer.write_all(b"STARTTLS\r\n"),
                 EXT_VERB => writer.write_all(b"VERB\r\n"),
+                EXT_XCLIENT => writer.write_all(b"XCLIENT ADDR PORT NAME HELO\r\n"),
                 _ => Ok(()),
             }?;
         }

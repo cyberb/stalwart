@@ -34,6 +34,7 @@ pub enum Request<T> {
     Etrn { name: T },
     Atrn { domains: Vec<T> },
     Burl { uri: T, is_last: bool },
+    Xclient { attributes: Vec<T> },
     StartTls,
     Data,
     Rset,
@@ -59,6 +60,7 @@ impl<T> Request<T> {
             Request::Etrn { .. } => "ETRN",
             Request::Atrn { .. } => "ATRN",
             Request::Burl { .. } => "BURL",
+            Request::Xclient { .. } => "XCLIENT",
             Request::StartTls => "STARTTLS",
             Request::Rset => "RSET",
             Request::Quit => "QUIT",
@@ -119,6 +121,9 @@ impl Request<Cow<'_, str>> {
             Request::Burl { uri, is_last } => Request::Burl {
                 uri: uri.into_owned(),
                 is_last,
+            },
+            Request::Xclient { attributes } => Request::Xclient {
+                attributes: attributes.into_iter().map(Cow::into_owned).collect(),
             },
             Request::StartTls => Request::StartTls,
             Request::Data => Request::Data,
@@ -303,6 +308,7 @@ pub const EXT_START_TLS: u32 = 1 << 24;
 pub const EXT_VERB: u32 = 1 << 25;
 pub const EXT_EXPN: u32 = 1 << 26;
 pub const EXT_VRFY: u32 = 1 << 27;
+pub const EXT_XCLIENT: u32 = 1 << 28;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

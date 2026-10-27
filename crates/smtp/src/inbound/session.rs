@@ -256,6 +256,9 @@ impl<T: SessionStream> Session<T> {
                                         .await?;
                                 }
                             }
+                            Request::Xclient { attributes } => {
+                                self.handle_xclient(&attributes).await?;
+                            }
                             cmd @ (Request::Etrn { .. }
                             | Request::Atrn { .. }
                             | Request::Burl { .. }) => {

@@ -217,6 +217,10 @@ impl<T: SessionStream> Session<T> {
             };
         }
 
+        if self.instance.unix_socket && self.data.authenticated_as.is_none() {
+            response.capabilities |= EXT_XCLIENT;
+        }
+
         // Generate response
         let mut buf = Vec::with_capacity(64);
         response.write(&mut buf).ok();

@@ -287,6 +287,21 @@ impl<'a> Request<Cow<'a, str>> {
                     syntax: "BURL absolute-uri [LAST]",
                 })
             }
+            XCLIENT => {
+                let mut attributes = Vec::new();
+                while parser.stop_char != LF {
+                    let attribute = parser.text()?;
+                    if !attribute.is_empty() {
+                        attributes.push(attribute);
+                    }
+                }
+                if !attributes.is_empty() {
+                    return Ok(Request::Xclient { attributes });
+                }
+                Err(Error::SyntaxError {
+                    syntax: "XCLIENT attribute=value [attribute=value ...]",
+                })
+            }
             HELO => {
                 if parser.stop_char != LF {
                     let host = parser.text()?;
