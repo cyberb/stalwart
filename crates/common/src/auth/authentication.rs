@@ -523,6 +523,26 @@ impl Server {
         })
     }
 
+    pub async fn admin_socket_access_token(
+        &self,
+        account: Option<&str>,
+        remote_ip: IpAddr,
+    ) -> trc::Result<AccessToken> {
+        let Some(account) = account else {
+            return Ok(AccessToken::new_admin());
+        };
+        let username = UsernameParts::new(account);
+        let Some(account_id) = self.impersonated_account_id(username.account()).await? else {
+            return Err(trc::AuthEvent::Failed
+                .into_err()
+                .ctx(trc::Key::AccountName, CompactString::from(account))
+                .reason("Account not found for admin socket impersonation"));
+        };
+        self.access_token(account_id)
+            .await
+            .and_then(|token| AccessToken::new(token, remote_ip))
+    }
+
     async fn impersonated_account_id(&self, username: &Username) -> trc::Result<Option<u32>> {
         let address = username.address();
 

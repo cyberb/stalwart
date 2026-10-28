@@ -49,6 +49,14 @@ pub fn unix_socket_path(listener: &str) -> Option<PathBuf> {
         })
 }
 
+pub fn admin_socket_path() -> Option<PathBuf> {
+    std::env::var("STALWART_ADMIN_SOCKET")
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 pub fn recovery_mode_port() -> u16 {
     std::env::var("STALWART_RECOVERY_MODE_PORT")
         .ok()
@@ -100,6 +108,18 @@ impl Listeners {
                 },
                 &SystemSettings::default(),
             );
+        }
+        if let Some(path) = admin_socket_path() {
+            servers.servers.push(Listener {
+                id: "_admin".to_string(),
+                protocol: ServerProtocol::Http,
+                unix_socket: Some((path, StdSocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))),
+                admin: true,
+                max_connections: SystemSettings::default().max_connections,
+                tls_timeout: DEFAULT_TLS_TIMEOUT,
+                span_id_gen: servers.span_id_gen.clone(),
+                ..Default::default()
+            });
         }
         servers
     }
@@ -243,6 +263,7 @@ impl Listeners {
             protocol,
             listeners,
             unix_socket,
+            admin: false,
             proxy_networks: if !listener.override_proxy_trusted_networks.is_empty() {
                 listener.override_proxy_trusted_networks.as_slice().to_vec()
             } else {

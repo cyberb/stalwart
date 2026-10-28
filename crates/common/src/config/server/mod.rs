@@ -34,6 +34,7 @@ pub struct Listener {
     pub protocol: ServerProtocol,
     pub listeners: Vec<TcpListener>,
     pub unix_socket: Option<(PathBuf, SocketAddr)>,
+    pub admin: bool,
     pub proxy_networks: Vec<IpAddrOrMask>,
     pub max_connections: u64,
     pub tls_timeout: Duration,

@@ -48,6 +48,7 @@ impl Listener {
             id: self.id,
             protocol: self.protocol,
             unix_socket: self.unix_socket.is_some(),
+            admin: self.admin,
             proxy_networks: self.proxy_networks,
             limiter: ConcurrencyLimiter::new(self.max_connections),
             tls_timeout: self.tls_timeout,
