@@ -271,7 +271,9 @@ impl ParseHttp for Server {
                             .await;
                     }
                     ("session", &Method::GET) => {
-                        return if req.headers().contains_key(header::AUTHORIZATION) {
+                        return if session.instance.admin
+                            || req.headers().contains_key(header::AUTHORIZATION)
+                        {
                             // Authenticate request
                             let HttpAuthenticated {
                                 in_flight: _in_flight,
