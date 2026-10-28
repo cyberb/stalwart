@@ -62,6 +62,7 @@ pub fn spawn_task_manager(inner: Arc<Inner>) {
         id: "_local".to_string(),
         protocol: ServerProtocol::Smtp,
         acceptor: TcpAcceptor::Plain,
+        admin: false,
         limiter: ConcurrencyLimiter::new(100),
         tls_timeout: DEFAULT_TLS_TIMEOUT,
         shutdown_rx: watch::channel(false).1,

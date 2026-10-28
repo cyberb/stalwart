@@ -39,6 +39,14 @@ use utils::snowflake::SnowflakeIdGenerator;
 
 const DEFAULT_RECOVERY_MODE_PORT: u16 = 8080;
 
+pub fn admin_socket_path() -> Option<PathBuf> {
+    std::env::var("STALWART_ADMIN_SOCKET")
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 pub fn recovery_mode_port() -> u16 {
     std::env::var("STALWART_RECOVERY_MODE_PORT")
         .ok()
@@ -90,6 +98,21 @@ impl Listeners {
                 },
                 &SystemSettings::default(),
             );
+        }
+        if let Some(path) = admin_socket_path() {
+            servers.servers.push(Listener {
+                id: "_admin".to_string(),
+                protocol: ServerProtocol::Http,
+                listeners: vec![ListenerSocket::Unix(UnixListener {
+                    path,
+                    local_addr: StdSocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                })],
+                admin: true,
+                max_connections: SystemSettings::default().max_connections,
+                tls_timeout: DEFAULT_TLS_TIMEOUT,
+                span_id_gen: servers.span_id_gen.clone(),
+                ..Default::default()
+            });
         }
         servers
     }
@@ -235,6 +258,7 @@ impl Listeners {
             registry_id: id,
             protocol,
             listeners,
+            admin: false,
             proxy_networks: if !listener.override_proxy_trusted_networks.is_empty() {
                 listener.override_proxy_trusted_networks.as_slice().to_vec()
             } else {

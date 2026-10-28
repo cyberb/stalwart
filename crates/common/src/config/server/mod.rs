@@ -33,6 +33,7 @@ pub struct Listener {
     pub id: String,
     pub protocol: ServerProtocol,
     pub listeners: Vec<ListenerSocket>,
+    pub admin: bool,
     pub proxy_networks: Vec<IpAddrOrMask>,
     pub max_connections: u64,
     pub tls_timeout: Duration,

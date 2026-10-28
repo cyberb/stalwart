@@ -47,6 +47,7 @@ impl Listener {
         let instance = Arc::new(ServerInstance {
             id: self.id,
             protocol: self.protocol,
+            admin: self.admin,
             proxy_networks: self.proxy_networks,
             limiter: ConcurrencyLimiter::new(self.max_connections),
             tls_timeout: self.tls_timeout,

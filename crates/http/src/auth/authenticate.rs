@@ -39,6 +39,36 @@ impl Authenticator for Server {
     ) -> trc::Result<HttpAuthenticated> {
         let revocations = &self.inner.cache.grant_revocations;
         let epoch = revocations.epoch();
+        if session.instance.admin {
+            let account = match req.authorization() {
+                None => None,
+                Some((mechanism, token)) if mechanism.eq_ignore_ascii_case("basic") => {
+                    match decode_plain_auth(token) {
+                        Some(Credentials::Basic { username, .. }) => Some(username),
+                        _ => {
+                            return Err(trc::AuthEvent::Error
+                                .into_err()
+                                .details("Failed to decode Basic auth request.")
+                                .caused_by(trc::location!()));
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(trc::AuthEvent::Error
+                        .into_err()
+                        .reason("Only Basic authentication selects an account on the admin socket.")
+                        .caused_by(trc::location!()));
+                }
+            };
+            return self
+                .admin_socket_access_token(account.as_deref(), session.remote_ip)
+                .await
+                .map(|access_token| HttpAuthenticated {
+                    in_flight: None,
+                    access_token,
+                    epoch,
+                });
+        }
         if let Some((mechanism, token)) = req.authorization() {
             // Check if the credentials are cached
             if let Some(http_cache) = self.inner.cache.http_auth.get(token) {
