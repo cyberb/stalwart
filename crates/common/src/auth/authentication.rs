@@ -25,7 +25,7 @@ use directory::{
 use encodify::base64::URL_SAFE_NO_PAD;
 use registry::schema::{
     enums::{OidcOpaqueTokenValidation, OidcUnscopedTokenPolicy, Permission},
-    structs::{self, Credential},
+    structs::{self, Credential, SecretKeyFile, SecretKeyOptional},
 };
 use serde::Deserialize;
 use std::{
@@ -41,6 +41,13 @@ use store::write::now;
 use trc::AddContext;
 
 const TOKEN_DIRECTORY_RETRY_SECS: u64 = 30;
+
+fn token_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 static TOKEN_DIRECTORY_RETRY: AtomicU64 = AtomicU64::new(0);
 static TOKEN_DIRECTORY: LazyLock<ArcSwapOption<Directory>> = LazyLock::new(ArcSwapOption::empty);
 static TOKEN_DIRECTORY_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -436,8 +443,17 @@ impl Server {
                     external_error = Some(err);
                 }
             }
-        } else if let Some(directory) = self.token_directory().await {
-            match self.authenticate_external_token(&directory, token).await {
+        } else if let Some((directory, client_id)) = self.token_directory().await {
+            match directory
+                .authenticate_token(
+                    token,
+                    &TokenContext {
+                        is_resource: &|_| false,
+                        is_first_party: &|client| client == client_id,
+                    },
+                )
+                .await
+            {
                 Ok(external) => {
                     let username = UsernameParts::new(&external.account.email);
                     let Some(account_id) =
@@ -486,17 +502,16 @@ impl Server {
         }
     }
 
-    async fn token_directory(&self) -> Option<Arc<Directory>> {
+    async fn token_directory(&self) -> Option<(Arc<Directory>, String)> {
+        let issuer = token_env("STALWART_TOKEN_ISSUER")?;
+        let client_id = token_env("STALWART_TOKEN_CLIENT_ID")?;
+        let secret_file = token_env("STALWART_TOKEN_CLIENT_SECRET_FILE")?;
         if let Some(directory) = TOKEN_DIRECTORY.load_full() {
-            return Some(directory);
+            return Some((directory, client_id));
         }
-        let issuer = std::env::var("STALWART_TOKEN_ISSUER")
-            .ok()
-            .map(|issuer| issuer.trim().to_string())
-            .filter(|issuer| !issuer.is_empty())?;
         let _guard = TOKEN_DIRECTORY_LOCK.lock().await;
         if let Some(directory) = TOKEN_DIRECTORY.load_full() {
-            return Some(directory);
+            return Some((directory, client_id));
         }
         let now = now();
         if now.saturating_sub(TOKEN_DIRECTORY_RETRY.load(Ordering::Relaxed))
@@ -508,19 +523,22 @@ impl Server {
         let config = structs::OidcDirectory {
             description: "token".to_string(),
             issuer_url: issuer,
-            username_domain: std::env::var("STALWART_DIRECTORY_EMAIL_DOMAIN")
-                .ok()
-                .map(|domain| domain.trim().to_string())
-                .filter(|domain| !domain.is_empty()),
-            opaque_token_validation: OidcOpaqueTokenValidation::UserInfo,
-            unscoped_tokens: OidcUnscopedTokenPolicy::Interoperable,
+            claim_username: "username".to_string(),
+            username_domain: token_env("STALWART_DIRECTORY_EMAIL_DOMAIN"),
+            opaque_token_validation: OidcOpaqueTokenValidation::Introspection,
+            introspection_client_id: Some(client_id.clone()),
+            introspection_client_secret: SecretKeyOptional::File(SecretKeyFile {
+                file_path: secret_file,
+            }),
+            unscoped_tokens: OidcUnscopedTokenPolicy::Reject,
+            skip_audience_validation: true,
             ..Default::default()
         };
         match OpenIdDirectory::open(config).await {
             Ok(directory) => {
                 let directory = Arc::new(directory);
                 TOKEN_DIRECTORY.store(Some(directory.clone()));
-                Some(directory)
+                Some((directory, client_id))
             }
             Err(err) => {
                 trc::event!(
