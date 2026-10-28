@@ -19,18 +19,32 @@ use crate::{
 use compact_str::CompactString;
 use directory::{
     Credentials, Directory, Recipient,
-    backend::oidc::{ExternalToken, TokenAccess, TokenContext},
+    backend::oidc::{ExternalToken, OpenIdDirectory, TokenAccess, TokenContext},
     core::secret::{SecretVerificationResult, verify_mfa_secret_hash, verify_secret_hash},
 };
 use encodify::base64::URL_SAFE_NO_PAD;
 use registry::schema::{
-    enums::Permission,
+    enums::{OidcOpaqueTokenValidation, OidcUnscopedTokenPolicy, Permission},
     structs::{self, Credential},
 };
 use serde::Deserialize;
-use std::{borrow::Cow, net::IpAddr, sync::Arc};
+use std::{
+    borrow::Cow,
+    net::IpAddr,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+use arc_swap::ArcSwapOption;
 use store::write::now;
 use trc::AddContext;
+
+const TOKEN_DIRECTORY_RETRY_SECS: u64 = 30;
+static TOKEN_DIRECTORY_RETRY: AtomicU64 = AtomicU64::new(0);
+static TOKEN_DIRECTORY: LazyLock<ArcSwapOption<Directory>> = LazyLock::new(ArcSwapOption::empty);
+static TOKEN_DIRECTORY_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 pub struct Authenticated {
     pub access_token: AccessToken,
@@ -422,6 +436,41 @@ impl Server {
                     external_error = Some(err);
                 }
             }
+        } else if let Some(directory) = self.token_directory().await {
+            match self.authenticate_external_token(&directory, token).await {
+                Ok(external) => {
+                    let username = UsernameParts::new(&external.account.email);
+                    let Some(account_id) =
+                        self.impersonated_account_id(username.account()).await?
+                    else {
+                        return Err(trc::AuthEvent::Failed
+                            .into_err()
+                            .ctx(
+                                trc::Key::AccountName,
+                                CompactString::from(external.account.email.as_str()),
+                            )
+                            .reason("Token user has no account in the default directory"));
+                    };
+                    let token_scope = match external.access {
+                        TokenAccess::Unrestricted => None,
+                        TokenAccess::Scoped(scopes) => Some(TokenScope::External {
+                            scopes: OAuthScopes::from_external(scopes),
+                        }),
+                    };
+                    let expires_in = external.expires_at.map(|exp| exp.saturating_sub(now()));
+                    return self
+                        .access_token(account_id)
+                        .await
+                        .and_then(|token| AccessToken::new(token, req.remote_ip))
+                        .map(|access_token| Authenticated {
+                            access_token: access_token.with_token_scope(token_scope),
+                            expires_in,
+                        });
+                }
+                Err(err) => {
+                    external_error = Some(err);
+                }
+            }
         }
 
         // Internal OAuth
@@ -433,6 +482,52 @@ impl Server {
                 } else {
                     Err(err)
                 }
+            }
+        }
+    }
+
+    async fn token_directory(&self) -> Option<Arc<Directory>> {
+        if let Some(directory) = TOKEN_DIRECTORY.load_full() {
+            return Some(directory);
+        }
+        let issuer = std::env::var("STALWART_TOKEN_ISSUER")
+            .ok()
+            .map(|issuer| issuer.trim().to_string())
+            .filter(|issuer| !issuer.is_empty())?;
+        let _guard = TOKEN_DIRECTORY_LOCK.lock().await;
+        if let Some(directory) = TOKEN_DIRECTORY.load_full() {
+            return Some(directory);
+        }
+        let now = now();
+        if now.saturating_sub(TOKEN_DIRECTORY_RETRY.load(Ordering::Relaxed))
+            < TOKEN_DIRECTORY_RETRY_SECS
+        {
+            return None;
+        }
+        TOKEN_DIRECTORY_RETRY.store(now, Ordering::Relaxed);
+        let config = structs::OidcDirectory {
+            description: "token".to_string(),
+            issuer_url: issuer,
+            username_domain: std::env::var("STALWART_DIRECTORY_EMAIL_DOMAIN")
+                .ok()
+                .map(|domain| domain.trim().to_string())
+                .filter(|domain| !domain.is_empty()),
+            opaque_token_validation: OidcOpaqueTokenValidation::UserInfo,
+            unscoped_tokens: OidcUnscopedTokenPolicy::Interoperable,
+            ..Default::default()
+        };
+        match OpenIdDirectory::open(config).await {
+            Ok(directory) => {
+                let directory = Arc::new(directory);
+                TOKEN_DIRECTORY.store(Some(directory.clone()));
+                Some(directory)
+            }
+            Err(err) => {
+                trc::event!(
+                    Auth(trc::AuthEvent::Warning),
+                    Reason = format!("Token issuer unavailable: {err}")
+                );
+                None
             }
         }
     }
